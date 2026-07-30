@@ -3,7 +3,7 @@ from datetime import datetime
 import streamlit as st
 import numpy as np
 from PIL import Image
-import io
+io = __import__('io')
 import pandas as pd
 
 # --- CONFIGURAÇÃO DO BANCO DE DADOS ---
@@ -121,7 +121,6 @@ elif tipo_usuario == "👷 Coordenador":
             funcoes_dict = get_funcoes()
             valor_diaria = funcoes_dict.get(funcao_prof, 0.0)
             
-            # Mostra apenas a função (sem valor da diária e sem o Pix)
             st.write(f"**Função:** {funcao_prof}")
             
             foto_capturada = st.camera_input("Tire a foto para bater o ponto")
@@ -233,28 +232,52 @@ elif tipo_usuario == "🔑 Administrador (Admin)":
         
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
-        cursor.execute("SELECT data_hora, nome, funcao, valor, pix FROM registros ORDER BY data_hora DESC")
+        cursor.execute("SELECT data_hora, nome, funcao, valor, pix, foto_ponto FROM registros ORDER BY data_hora DESC")
         registros = cursor.fetchall()
         conn.close()
         
         if not registros:
             st.info("Nenhum registro de ponto encontrado até o momento.")
         else:
-            df = pd.DataFrame(registros, columns=["Data e Hora", "Nome", "Função", "Valor Diária (R$)", "Chave Pix"])
+            # Filtro por profissional
+            nomes_unicos = sorted(list(set([r[1] for r in registros])))
+            filtro_nome = st.selectbox("Filtrar por Profissional", ["Todos"] + nomes_unicos)
             
-            st.subheader("Filtros")
-            lista_nomes = ["Todos"] + list(df["Nome"].unique())
-            filtro_nome = st.selectbox("Filtrar por Profissional", lista_nomes)
+            st.divider()
             
-            if filtro_nome != "Todos":
-                df_filtrado = df[df["Nome"] == filtro_nome]
-            else:
-                df_filtrado = df
+            total_geral = 0.0
+            
+            for reg in registros:
+                data_hora, nome, funcao, valor, pix, foto_bytes = reg
                 
-            st.dataframe(df_filtrado, use_container_width=True)
-            
-            total_geral = df_filtrado["Valor Diária (R$)"].sum()
-            st.metric(label="Total Acumulado a Pagar", value=f"R$ {total_geral:.2f}")
+                if filtro_nome != "Todos" and nome != filtro_nome:
+                    continue
+                
+                total_geral += valor
+                
+                # Exibição individual em colunas para cada registro (facilitando ver a foto)
+                col_foto, col_info = st.columns([1, 2])
+                
+                with col_foto:
+                    if foto_bytes:
+                        try:
+                            img = Image.open(io.BytesIO(foto_bytes))
+                            st.image(img, caption=f"Foto de {nome}", width=150)
+                        except Exception:
+                            st.write("Erro ao carregar foto")
+                    else:
+                        st.write("Sem foto")
+                        
+                with col_info:
+                    st.markdown(f"**👤 Nome:** {nome}")
+                    st.markdown(f"**🛠️ Função:** {funcao}")
+                    st.markdown(f"**📅 Data/Hora:** {data_hora}")
+                    st.markdown(f"**💰 Valor Diária:** R$ {valor:.2f}")
+                    st.markdown(f"**📱 Chave Pix:** {pix}")
+                
+                st.divider()
+                
+            st.metric(label="Total Acumulado a Pagar (Filtro Atual)", value=f"R$ {total_geral:.2f}")
 
     elif menu_admin == "⚙️ Gerenciar Funções e Valores":
         st.header("⚙️ Gerenciamento de Funções e Valores")
