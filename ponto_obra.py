@@ -1,0 +1,301 @@
+import sqlite3
+from datetime import datetime
+import streamlit as st
+import numpy as np
+from PIL import Image
+import io
+import pandas as pd
+
+# --- CONFIGURAÇÃO DO BANCO DE DADOS ---
+DB_NAME = "ponto_eletronico.db"
+
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS funcoes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            nome TEXT UNIQUE NOT NULL,
+            valor REAL NOT NULL
+        )
+    """)
+    
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS profissionais (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            nome TEXT NOT NULL,
+            documento TEXT NOT NULL,
+            funcao TEXT NOT NULL,
+            chave_pix TEXT NOT NULL,
+            foto BLOB
+        )
+    """)
+    
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS registros (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            data_hora TEXT NOT NULL,
+            data_dia TEXT NOT NULL,
+            nome TEXT NOT NULL,
+            funcao TEXT NOT NULL,
+            valor REAL NOT NULL,
+            pix TEXT NOT NULL,
+            foto_ponto BLOB
+        )
+    """)
+    
+    cursor.execute("SELECT COUNT(*) FROM funcoes")
+    if cursor.fetchone()[0] == 0:
+        funcoes_iniciais = [
+            ("Encarregado", 300.0),
+            ("Pedreiro", 250.0),
+            ("Pintor", 250.0),
+            ("Meio Oficial", 200.0),
+            ("Ajudante", 150.0)
+        ]
+        cursor.executemany("INSERT INTO funcoes (nome, valor) VALUES (?, ?)", funcoes_iniciais)
+    else:
+        cursor.execute("INSERT OR IGNORE INTO funcoes (nome, valor) VALUES ('Encarregado', 300.0)")
+        
+    conn.commit()
+    conn.close()
+
+init_db()
+
+def get_funcoes():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT nome, valor FROM funcoes")
+    data = cursor.fetchall()
+    conn.close()
+    return {row[0]: row[1] for row in data}
+
+def get_profissionais():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, nome, documento, funcao, chave_pix, foto FROM profissionais")
+    data = cursor.fetchall()
+    conn.close()
+    return data
+
+# --- INTERFACE STREAMLIT ---
+st.set_page_config(page_title="PontoObraMads", layout="centered")
+
+st.title("🏗️ PontoObraMads - Controle de Diárias")
+
+# --- CONTROLE DE ACESSO (LOGIN) NA BARRA LATERAL ---
+st.sidebar.header("🔐 Acesso ao Sistema")
+tipo_usuario = st.sidebar.selectbox("Selecione o Perfil", ["Selecione...", "👷 Coordenador", "🔑 Administrador (Admin)"])
+
+data_hoje = datetime.now().strftime("%Y-%m-%d")
+horario_atual = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+if tipo_usuario == "Selecione...":
+    st.info("👈 Por favor, selecione o seu perfil de acesso no menu lateral (Coordenador ou Administrador) para começar.")
+
+# ==========================================
+# PERFIL: COORDENADOR
+# ==========================================
+elif tipo_usuario == "👷 Coordenador":
+    st.sidebar.divider()
+    st.sidebar.subheader("Menu do Coordenador")
+    menu_coord = st.sidebar.radio("Escolha a Ação", ["📸 Registrar Ponto", "➕ Cadastrar Profissional", "✏️ Editar Cadastro"])
+    
+    if menu_coord == "📸 Registrar Ponto":
+        st.header("📸 Registro de Ponto com Horário")
+        st.info("Selecione o profissional e tire a foto para registrar o ponto com a hora exata.")
+        
+        profissionais = get_profissionais()
+        
+        if not profissionais:
+            st.warning("Nenhum profissional cadastrado no sistema.")
+        else:
+            nomes_profissionais = [p[1] for p in profissionais]
+            prof_selecionado = st.selectbox("Selecione o Profissional", nomes_profissionais)
+            
+            dados_prof = next(p for p in profissionais if p[1] == prof_selecionado)
+            funcao_prof = dados_prof[3]
+            pix_prof = dados_prof[4]
+            
+            funcoes_dict = get_funcoes()
+            valor_diaria = funcoes_dict.get(funcao_prof, 0.0)
+            
+            # Mostra apenas a função (sem valor da diária e sem o Pix)
+            st.write(f"**Função:** {funcao_prof}")
+            
+            foto_capturada = st.camera_input("Tire a foto para bater o ponto")
+            
+            if foto_capturada is not None:
+                image_bytes = foto_capturada.getvalue()
+                conn = sqlite3.connect(DB_NAME)
+                cursor = conn.cursor()
+                
+                cursor.execute("SELECT id FROM registros WHERE data_dia = ? AND nome = ?", (data_hoje, prof_selecionado))
+                ja_registrado = cursor.fetchone()
+                
+                if ja_registrado:
+                    st.warning(f"⚠️ O profissional {prof_selecionado} já registrou ponto hoje ({data_hoje}).")
+                else:
+                    cursor.execute("""
+                        INSERT INTO registros (data_hora, data_dia, nome, funcao, valor, pix, foto_ponto)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (horario_atual, data_hoje, prof_selecionado, funcao_prof, valor_diaria, pix_prof, image_bytes))
+                    conn.commit()
+                    st.success(f"✅ Ponto registrado com sucesso às {datetime.now().strftime('%H:%M:%S')}!")
+                    st.balloons()
+                conn.close()
+
+    elif menu_coord == "➕ Cadastrar Profissional":
+        st.header("➕ Cadastrar Novo Profissional")
+        funcoes_dict = get_funcoes()
+        
+        with st.form("form_cadastro"):
+            nome = st.text_input("Nome Completo")
+            documento = st.text_input("RG ou CPF")
+            funcao = st.selectbox("Função", list(funcoes_dict.keys()))
+            chave_pix = st.text_input("Chave Pix")
+            foto_cadastro = st.camera_input("Tirar Foto de Perfil (Foco nítido no rosto)")
+            
+            submitted = st.form_submit_button("Salvar Cadastro")
+            
+            if submitted:
+                if nome and documento and chave_pix and foto_cadastro:
+                    foto_bytes = foto_cadastro.getvalue()
+                    conn = sqlite3.connect(DB_NAME)
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        INSERT INTO profissionais (nome, documento, funcao, chave_pix, foto)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (nome, documento, funcao, chave_pix, foto_bytes))
+                    conn.commit()
+                    conn.close()
+                    st.success(f"Profissional {nome} cadastrado com sucesso!")
+                else:
+                    st.error("Preencha todos os campos e tire a foto.")
+
+    elif menu_coord == "✏️ Editar Cadastro":
+        st.header("✏️ Editar Cadastro de Profissional")
+        st.info("Selecione o profissional abaixo para atualizar dados como Chave Pix, função ou nome.")
+        
+        profissionais = get_profissionais()
+        
+        if not profissionais:
+            st.warning("Nenhum profissional cadastrado para editar.")
+        else:
+            nomes_profissionais = [p[1] for p in profissionais]
+            prof_edicao = st.selectbox("Selecione o Profissional", nomes_profissionais)
+            
+            dados_atuais = next(p for p in profissionais if p[1] == prof_edicao)
+            prof_id = dados_atuais[0]
+            nome_atual = dados_atuais[1]
+            doc_atual = dados_atuais[2]
+            func_atual = dados_atuais[3]
+            pix_atual = dados_atuais[4]
+            
+            funcoes_dict = get_funcoes()
+            
+            with st.form("form_edicao"):
+                novo_nome = st.text_input("Nome Completo", value=nome_atual)
+                novo_doc = st.text_input("RG ou CPF", value=doc_atual)
+                
+                lista_funcs = list(funcoes_dict.keys())
+                idx_func = lista_funcs.index(func_atual) if func_atual in lista_funcs else 0
+                nova_funcao = st.selectbox("Função", lista_funcs, index=idx_func)
+                
+                nova_chave_pix = st.text_input("Chave Pix", value=pix_atual)
+                
+                atualizar_btn = st.form_submit_button("Atualizar Dados")
+                
+                if atualizar_btn:
+                    conn = sqlite3.connect(DB_NAME)
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        UPDATE profissionais 
+                        SET nome = ?, documento = ?, funcao = ?, chave_pix = ?
+                        WHERE id = ?
+                    """, (novo_nome, novo_doc, nova_funcao, nova_chave_pix, prof_id))
+                    conn.commit()
+                    conn.close()
+                    st.success(f"Cadastro de {novo_nome} atualizado com sucesso! (Nova Chave Pix: {nova_chave_pix})")
+                    st.rerun()
+
+# ==========================================
+# PERFIL: ADMINISTRADOR
+# ==========================================
+elif tipo_usuario == "🔑 Administrador (Admin)":
+    st.sidebar.divider()
+    st.sidebar.subheader("Menu do Administrador")
+    menu_admin = st.sidebar.radio("Escolha a Ação", ["📋 Relatórios e Filtros", "⚙️ Gerenciar Funções e Valores", "👷 Ver Profissionais Cadastrados"])
+    
+    if menu_admin == "📋 Relatórios e Filtros":
+        st.header("📋 Relatórios de Pagamentos e Frequência")
+        
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("SELECT data_hora, nome, funcao, valor, pix FROM registros ORDER BY data_hora DESC")
+        registros = cursor.fetchall()
+        conn.close()
+        
+        if not registros:
+            st.info("Nenhum registro de ponto encontrado até o momento.")
+        else:
+            df = pd.DataFrame(registros, columns=["Data e Hora", "Nome", "Função", "Valor Diária (R$)", "Chave Pix"])
+            
+            st.subheader("Filtros")
+            lista_nomes = ["Todos"] + list(df["Nome"].unique())
+            filtro_nome = st.selectbox("Filtrar por Profissional", lista_nomes)
+            
+            if filtro_nome != "Todos":
+                df_filtrado = df[df["Nome"] == filtro_nome]
+            else:
+                df_filtrado = df
+                
+            st.dataframe(df_filtrado, use_container_width=True)
+            
+            total_geral = df_filtrado["Valor Diária (R$)"].sum()
+            st.metric(label="Total Acumulado a Pagar", value=f"R$ {total_geral:.2f}")
+
+    elif menu_admin == "⚙️ Gerenciar Funções e Valores":
+        st.header("⚙️ Gerenciamento de Funções e Valores")
+        
+        funcoes_dict = get_funcoes()
+        
+        st.subheader("Valores Atuais")
+        for func, val in funcoes_dict.items():
+            st.write(f"- **{func}**: R$ {val:.2f}")
+            
+        st.divider()
+        st.subheader("Adicionar Nova Função ou Atualizar Valor")
+        
+        with st.form("form_funcao"):
+            nova_funcao = st.text_input("Nome da Nova Função (ou existente para atualizar)")
+            novo_valor = st.number_input("Valor da Diária (R$)", min_value=0.0, step=10.0)
+            
+            btn_salvar_funcao = st.form_submit_button("Salvar Função")
+            
+            if btn_salvar_funcao:
+                if nova_funcao and novo_valor > 0:
+                    conn = sqlite3.connect(DB_NAME)
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        INSERT INTO funcoes (nome, valor) VALUES (?, ?)
+                        ON CONFLICT(nome) DO UPDATE SET valor=excluded.valor
+                    """, (nova_funcao, novo_valor))
+                    conn.commit()
+                    conn.close()
+                    st.success(f"Função '{nova_funcao}' salva com o valor de R$ {novo_valor:.2f}!")
+                    st.rerun()
+                else:
+                    st.error("Preencha o nome da função e um valor válido.")
+
+    elif menu_admin == "👷 Ver Profissionais Cadastrados":
+        st.header("👷 Lista de Profissionais no Sistema")
+        profissionais = get_profissionais()
+        
+        if not profissionais:
+            st.info("Nenhum profissional cadastrado.")
+        else:
+            df_prof = pd.DataFrame(profissionais, columns=["ID", "Nome", "Documento", "Função", "Chave Pix", "Foto Blob"])
+            df_exibicao = df_prof.drop(columns=["Foto Blob"])
+            st.dataframe(df_exibicao, use_container_width=True)
