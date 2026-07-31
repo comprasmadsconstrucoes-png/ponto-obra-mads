@@ -1,4 +1,6 @@
 streamlit
 pandas
-Pillow
 numpy
+Pillow
+face-recognition
+streamlit-geolocation
