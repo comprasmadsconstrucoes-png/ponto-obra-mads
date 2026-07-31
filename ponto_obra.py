@@ -3,8 +3,9 @@ from datetime import datetime
 import streamlit as st
 import numpy as np
 from PIL import Image
-io = __import__('io')
+import io
 import pandas as pd
+import face_recognition
 
 # --- CONFIGURAÇÃO DO BANCO DE DADOS ---
 DB_NAME = "ponto_eletronico.db"
@@ -25,10 +26,11 @@ def init_db():
         CREATE TABLE IF NOT EXISTS profissionais (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             nome TEXT NOT NULL,
-            documento TEXT NOT NULL,
+            documento TEXT UNIQUE NOT NULL,
             funcao TEXT NOT NULL,
             chave_pix TEXT NOT NULL,
-            foto BLOB
+            foto BLOB,
+            face_encoding BLOB
         )
     """)
     
@@ -37,11 +39,16 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             data_hora TEXT NOT NULL,
             data_dia TEXT NOT NULL,
+            id_profissional INTEGER NOT NULL,
             nome TEXT NOT NULL,
             funcao TEXT NOT NULL,
             valor REAL NOT NULL,
             pix TEXT NOT NULL,
-            foto_ponto BLOB
+            foto_ponto BLOB,
+            latitude REAL,
+            longitude REAL,
+            status_facial TEXT,
+            FOREIGN KEY (id_profissional) REFERENCES profissionais (id)
         )
     """)
     
@@ -74,7 +81,7 @@ def get_funcoes():
 def get_profissionais():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("SELECT id, nome, documento, funcao, chave_pix, foto FROM profissionais")
+    cursor.execute("SELECT id, nome, documento, funcao, chave_pix, foto, face_encoding FROM profissionais")
     data = cursor.fetchall()
     conn.close()
     return data
@@ -103,8 +110,8 @@ elif tipo_usuario == "👷 Coordenador":
     menu_coord = st.sidebar.radio("Escolha a Ação", ["📸 Registrar Ponto", "➕ Cadastrar Profissional", "✏️ Editar Cadastro"])
     
     if menu_coord == "📸 Registrar Ponto":
-        st.header("📸 Registro de Ponto com Horário")
-        st.info("Selecione o profissional e tire a foto para registrar o ponto com a hora exata.")
+        st.header("📸 Registro de Ponto com Biometria e GPS")
+        st.info("Selecione o profissional, tire a foto e capture a localização para registrar o ponto.")
         
         profissionais = get_profissionais()
         
@@ -115,68 +122,111 @@ elif tipo_usuario == "👷 Coordenador":
             prof_selecionado = st.selectbox("Selecione o Profissional", nomes_profissionais)
             
             dados_prof = next(p for p in profissionais if p[1] == prof_selecionado)
+            prof_id = dados_prof[0]
             funcao_prof = dados_prof[3]
             pix_prof = dados_prof[4]
+            cad_encoding_blob = dados_prof[6]
             
             funcoes_dict = get_funcoes()
             valor_diaria = funcoes_dict.get(funcao_prof, 0.0)
             
             st.write(f"**Função:** {funcao_prof}")
             
+            # Coordenadas GPS via Streamlit components (ou input manual/simulado se indisponível no browser)
+            st.markdown("📍 **Localização GPS da Obra**")
+            lat = st.number_input("Latitude", value=-23.5505, format="%.6f")
+            lon = st.number_input("Longitude", value=-46.6333, format="%.6f")
+            
             foto_capturada = st.camera_input("Tire a foto para bater o ponto")
             
             if foto_capturada is not None:
                 image_bytes = foto_capturada.getvalue()
-                conn = sqlite3.connect(DB_NAME)
-                cursor = conn.cursor()
                 
-                cursor.execute("SELECT id FROM registros WHERE data_dia = ? AND nome = ?", (data_hoje, prof_selecionado))
-                ja_registrado = cursor.fetchone()
-                
-                if ja_registrado:
-                    st.warning(f"⚠️ O profissional {prof_selecionado} já registrou ponto hoje ({data_hoje}).")
+                # Processamento de Reconhecimento Facial
+                if not cad_encoding_blob:
+                    st.error("⚠️ Este profissional não possui vetor facial cadastrado. Atualize o cadastro dele tirando uma foto nítida.")
                 else:
-                    cursor.execute("""
-                        INSERT INTO registros (data_hora, data_dia, nome, funcao, valor, pix, foto_ponto)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """, (horario_atual, data_hoje, prof_selecionado, funcao_prof, valor_diaria, pix_prof, image_bytes))
-                    conn.commit()
-                    st.success(f"✅ Ponto registrado com sucesso às {datetime.now().strftime('%H:%M:%S')}!")
-                    st.balloons()
-                conn.close()
+                    try:
+                        # Converter imagem capturada para array numpy
+                        img_ponto_pil = Image.open(io.BytesIO(image_bytes))
+                        img_ponto_np = np.array(img_ponto_pil)
+                        
+                        locs_ponto = face_recognition.face_locations(img_ponto_np)
+                        if not locs_ponto:
+                            st.error("❌ Nenhum rosto detectado na foto do ponto. Tente novamente com boa iluminação.")
+                        else:
+                            encoding_ponto = face_recognition.face_encodings(img_ponto_np, locs_ponto)[0]
+                            encoding_cadastrado = np.frombuffer(cad_encoding_blob, dtype=np.float64)
+                            
+                            # Comparar rostos (tolerância 0.6 padrão)
+                            match = face_recognition.compare_faces([encoding_cadastrado], encoding_ponto, tolerance=0.6)[0]
+                            
+                            if not match:
+                                st.error("🚨 ERRO: O rosto na foto NÃO corresponde ao profissional cadastrado! Ponto recusado.")
+                            else:
+                                conn = sqlite3.connect(DB_NAME)
+                                cursor = conn.cursor()
+                                
+                                cursor.execute("SELECT id FROM registros WHERE data_dia = ? AND id_profissional = ?", (data_hoje, prof_id))
+                                ja_registrado = cursor.fetchone()
+                                
+                                if ja_registrado:
+                                    st.warning(f"⚠️ O profissional {prof_selecionado} já registrou ponto hoje ({data_hoje}).")
+                                else:
+                                    cursor.execute("""
+                                        INSERT INTO registros (data_hora, data_dia, id_profissional, nome, funcao, valor, pix, foto_ponto, latitude, longitude, status_facial)
+                                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                    """, (horario_atual, data_hoje, prof_id, prof_selecionado, funcao_prof, valor_diaria, pix_prof, image_bytes, lat, lon, "Aprovado"))
+                                    conn.commit()
+                                    st.success(f"✅ Ponto validado por Reconhecimento Facial e registrado às {datetime.now().strftime('%H:%M:%S')}!")
+                                    st.balloons()
+                                conn.close()
+                    except Exception as e:
+                        st.error(f"Erro ao processar biometria facial: {e}")
 
     elif menu_coord == "➕ Cadastrar Profissional":
-        st.header("➕ Cadastrar Novo Profissional")
+        st.header("➕ Cadastrar Novo Profissional (com Biometria)")
         funcoes_dict = get_funcoes()
         
         with st.form("form_cadastro"):
             nome = st.text_input("Nome Completo")
-            documento = st.text_input("RG ou CPF")
+            documento = st.text_input("CPF (Único)")
             funcao = st.selectbox("Função", list(funcoes_dict.keys()))
             chave_pix = st.text_input("Chave Pix")
-            foto_cadastro = st.camera_input("Tirar Foto de Perfil (Foco nítido no rosto)")
+            foto_cadastro = st.camera_input("Tirar Foto de Perfil (Foco nítido e centralizado no rosto)")
             
             submitted = st.form_submit_button("Salvar Cadastro")
             
             if submitted:
                 if nome and documento and chave_pix and foto_cadastro:
-                    foto_bytes = foto_cadastro.getvalue()
-                    conn = sqlite3.connect(DB_NAME)
-                    cursor = conn.cursor()
-                    cursor.execute("""
-                        INSERT INTO profissionais (nome, documento, funcao, chave_pix, foto)
-                        VALUES (?, ?, ?, ?, ?)
-                    """, (nome, documento, funcao, chave_pix, foto_bytes))
-                    conn.commit()
-                    conn.close()
-                    st.success(f"Profissional {nome} cadastrado com sucesso!")
+                    try:
+                        img_cad_pil = Image.open(foto_cadastro)
+                        img_cad_np = np.array(img_cad_pil)
+                        
+                        locs = face_recognition.face_locations(img_cad_np)
+                        if not locs:
+                            st.error("❌ Nenhum rosto encontrado na foto de cadastro. Tire outra foto nítida.")
+                        else:
+                            encoding = face_recognition.face_encodings(img_cad_np, locs)[0]
+                            encoding_bytes = encoding.tobytes()
+                            foto_bytes = foto_cadastro.getvalue()
+                            
+                            conn = sqlite3.connect(DB_NAME)
+                            cursor = conn.cursor()
+                            cursor.execute("""
+                                INSERT INTO profissionais (nome, documento, funcao, chave_pix, foto, face_encoding)
+                                VALUES (?, ?, ?, ?, ?, ?)
+                            """, (nome, documento, funcao, chave_pix, foto_bytes, encoding_bytes))
+                            conn.commit()
+                            conn.close()
+                            st.success(f"Profissional {nome} cadastrado com sucesso com biometria facial!")
+                    except Exception as e:
+                        st.error(f"Erro ao salvar cadastro: {e}")
                 else:
                     st.error("Preencha todos os campos e tire a foto.")
 
     elif menu_coord == "✏️ Editar Cadastro":
         st.header("✏️ Editar Cadastro de Profissional")
-        st.info("Selecione o profissional abaixo para atualizar dados como Chave Pix, função ou nome.")
-        
         profissionais = get_profissionais()
         
         if not profissionais:
@@ -196,7 +246,7 @@ elif tipo_usuario == "👷 Coordenador":
             
             with st.form("form_edicao"):
                 novo_nome = st.text_input("Nome Completo", value=nome_atual)
-                novo_doc = st.text_input("RG ou CPF", value=doc_atual)
+                novo_doc = st.text_input("CPF", value=doc_atual)
                 
                 lista_funcs = list(funcoes_dict.keys())
                 idx_func = lista_funcs.index(func_atual) if func_atual in lista_funcs else 0
@@ -216,7 +266,7 @@ elif tipo_usuario == "👷 Coordenador":
                     """, (novo_nome, novo_doc, nova_funcao, nova_chave_pix, prof_id))
                     conn.commit()
                     conn.close()
-                    st.success(f"Cadastro de {novo_nome} atualizado com sucesso! (Nova Chave Pix: {nova_chave_pix})")
+                    st.success(f"Cadastro de {novo_nome} atualizado com sucesso!")
                     st.rerun()
 
 # ==========================================
@@ -228,41 +278,38 @@ elif tipo_usuario == "🔑 Administrador (Admin)":
     menu_admin = st.sidebar.radio("Escolha a Ação", ["📋 Relatórios e Filtros", "⚙️ Gerenciar Funções e Valores", "👷 Ver Profissionais Cadastrados"])
     
     if menu_admin == "📋 Relatórios e Filtros":
-        st.header("📋 Relatórios de Pagamentos e Frequência")
+        st.header("📋 Relatórios de Frequência, Biometria e GPS")
         
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
-        cursor.execute("SELECT data_hora, nome, funcao, valor, pix, foto_ponto FROM registros ORDER BY data_hora DESC")
+        cursor.execute("SELECT data_hora, nome, funcao, valor, pix, foto_ponto, latitude, longitude, status_facial FROM registros ORDER BY data_hora DESC")
         registros = cursor.fetchall()
         conn.close()
         
         if not registros:
             st.info("Nenhum registro de ponto encontrado até o momento.")
         else:
-            # Filtro por profissional
             nomes_unicos = sorted(list(set([r[1] for r in registros])))
             filtro_nome = st.selectbox("Filtrar por Profissional", ["Todos"] + nomes_unicos)
             
             st.divider()
-            
             total_geral = 0.0
             
             for reg in registros:
-                data_hora, nome, funcao, valor, pix, foto_bytes = reg
+                data_hora, nome, funcao, valor, pix, foto_bytes, lat, lon, status_facial = reg
                 
                 if filtro_nome != "Todos" and nome != filtro_nome:
                     continue
                 
                 total_geral += valor
                 
-                # Exibição individual em colunas para cada registro (facilitando ver a foto)
                 col_foto, col_info = st.columns([1, 2])
                 
                 with col_foto:
                     if foto_bytes:
                         try:
                             img = Image.open(io.BytesIO(foto_bytes))
-                            st.image(img, caption=f"Foto de {nome}", width=150)
+                            st.image(img, caption=f"Ponto de {nome}", width=150)
                         except Exception:
                             st.write("Erro ao carregar foto")
                     else:
@@ -272,8 +319,10 @@ elif tipo_usuario == "🔑 Administrador (Admin)":
                     st.markdown(f"**👤 Nome:** {nome}")
                     st.markdown(f"**🛠️ Função:** {funcao}")
                     st.markdown(f"**📅 Data/Hora:** {data_hora}")
-                    st.markdown(f"**💰 Valor Diária:** R$ {valor:.2f}")
-                    st.markdown(f"**📱 Chave Pix:** {pix}")
+                    st.markdown(f"**💰 Diária:** R$ {valor:.2f}")
+                    st.markdown(f"**📱 Pix:** {pix}")
+                    st.markdown(f"**📍 GPS:** `{lat}, {lon}`")
+                    st.markdown(f"**🔒 Validação Facial:** ✅ {status_facial}")
                 
                 st.divider()
                 
@@ -281,7 +330,6 @@ elif tipo_usuario == "🔑 Administrador (Admin)":
 
     elif menu_admin == "⚙️ Gerenciar Funções e Valores":
         st.header("⚙️ Gerenciamento de Funções e Valores")
-        
         funcoes_dict = get_funcoes()
         
         st.subheader("Valores Atuais")
@@ -289,12 +337,9 @@ elif tipo_usuario == "🔑 Administrador (Admin)":
             st.write(f"- **{func}**: R$ {val:.2f}")
             
         st.divider()
-        st.subheader("Adicionar Nova Função ou Atualizar Valor")
-        
         with st.form("form_funcao"):
             nova_funcao = st.text_input("Nome da Nova Função (ou existente para atualizar)")
             novo_valor = st.number_input("Valor da Diária (R$)", min_value=0.0, step=10.0)
-            
             btn_salvar_funcao = st.form_submit_button("Salvar Função")
             
             if btn_salvar_funcao:
@@ -319,6 +364,7 @@ elif tipo_usuario == "🔑 Administrador (Admin)":
         if not profissionais:
             st.info("Nenhum profissional cadastrado.")
         else:
-            df_prof = pd.DataFrame(profissionais, columns=["ID", "Nome", "Documento", "Função", "Chave Pix", "Foto Blob"])
-            df_exibicao = df_prof.drop(columns=["Foto Blob"])
+            # Omitindo blobs pesados no dataframe visual
+            df_prof = pd.DataFrame(profissionais, columns=["ID", "Nome", "Documento", "Função", "Chave Pix", "Foto Blob", "Encoding Blob"])
+            df_exibicao = df_prof.drop(columns=["Foto Blob", "Encoding Blob"])
             st.dataframe(df_exibicao, use_container_width=True)
